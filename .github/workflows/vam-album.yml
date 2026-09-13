@@ -1,0 +1,146 @@
+name: Large V&A 500mm seating album
+on:
+  push:
+    paths: ['.github/workflows/vam-album.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install pillow reportlab pypdf
+      - name: Collect V&A seating and render PDF
+        shell: bash
+        run: |
+          cat > /tmp/vam.py <<'PY'
+          import urllib.request, urllib.parse, json, re, io, csv, time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          from PIL import Image
+          from reportlab.pdfgen import canvas
+          from reportlab.lib.pagesizes import A4,landscape
+          from reportlab.lib.utils import ImageReader
+          from reportlab.pdfbase.pdfmetrics import stringWidth
+          from pypdf import PdfReader
+          OUT=Path('vam_album'); IMG=OUT/'images'; IMG.mkdir(parents=True,exist_ok=True)
+          UA='Mozilla/5.0 AHO industrial design research'
+          def clean(x):return re.sub(r'\s+',' ',str(x or '')).strip()
+          def fetch(url, binary=False, tries=4, timeout=25):
+            for a in range(tries):
+              try:
+                req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
+                with urllib.request.urlopen(req,timeout=timeout) as r:
+                  b=r.read()
+                return b if binary else json.loads(b)
+              except Exception:
+                if a==tries-1:return None
+                time.sleep(.35*(a+1))
+          def cm(v,u):
+            try:x=float(str(v).replace(',','.'))
+            except:return None
+            u=clean(u).lower()
+            if u in ('cm','centimetre','centimeter','centimetres','centimeters'):return x
+            if u in ('mm','millimetre','millimeter','millimetres','millimeters'):return x/10
+            if u in ('m','metre','meter','metres','meters'):return x*100
+            if u in ('in','inch','inches'):return x*2.54
+            return None
+          def fit_dims(rec):
+            ax={}
+            for d in rec.get('dimensions') or []:
+              n=clean(d.get('dimension')).lower(); x=cm(d.get('value'),d.get('unit'))
+              if not x or x<=0:continue
+              key=None
+              if 'height' in n:key='height'
+              elif 'diameter' in n:key='diameter'
+              elif 'width' in n:key='width'
+              elif 'depth' in n:key='depth'
+              elif 'length' in n:key='length'
+              if key:ax[key]=max(ax.get(key,0),x)
+            if 'height' not in ax:return None
+            if 'diameter' in ax: vals=(ax['height'],ax['diameter'],ax['diameter'])
+            elif all(k in ax for k in ('height','width','depth')): vals=(ax['height'],ax['width'],ax['depth'])
+            elif all(k in ax for k in ('height','width','length')): vals=(ax['height'],ax['width'],ax['length'])
+            elif all(k in ax for k in ('height','depth','length')): vals=(ax['height'],ax['depth'],ax['length'])
+            else:return None
+            if max(vals)>50.0001:return None
+            return tuple(round(x,1) for x in vals)
+          terms=['stool','footstool','tabouret','ottoman','hassock','folding stool','low stool','milking stool','piano stool','child stool','kneeling stool','music stool','chair','seat']
+          stubs={}; counts={}
+          for term in terms:
+            base='https://api.vam.ac.uk/v2/objects/search?'
+            u=base+urllib.parse.urlencode({'q_object_name':term,'images_exist':1,'page_size':100,'page':1})
+            d=fetch(u)
+            if not d:
+              # V&A can reject large page size on some deployments; retry smaller.
+              u=base+urllib.parse.urlencode({'q_object_name':term,'images_exist':1,'page_size':45,'page':1});d=fetch(u)
+            if not d:continue
+            info=d.get('info') or {}; counts[term]=int(info.get('record_count') or 0); pages=int(info.get('pages') or 1); ps=int(info.get('page_size') or 45)
+            datasets=[d]
+            for p in range(2,min(pages,30)+1):
+              z=fetch(base+urllib.parse.urlencode({'q_object_name':term,'images_exist':1,'page_size':ps,'page':p}))
+              if z:datasets.append(z)
+            for z in datasets:
+              for s in z.get('records') or []:
+                sn=s.get('systemNumber'); iid=s.get('_primaryImageId')
+                if not sn or not iid:continue
+                stubs[sn]={'id':sn,'title':clean(s.get('_primaryTitle')) or clean(s.get('objectType')) or term.title(),'maker':clean((s.get('_primaryMaker') or {}).get('name')),'date':clean(s.get('_primaryDate')),'iid':iid,'otype':clean(s.get('objectType'))}
+          print('COUNTS',json.dumps(counts,ensure_ascii=False),'STUBS',len(stubs),flush=True)
+          def detail(pair):
+            sn,s=pair; d=fetch('https://api.vam.ac.uk/v2/museumobject/'+sn,tries=3,timeout=20)
+            if not d:return None
+            r=d.get('record') or {}; dims=fit_dims(r)
+            if not dims:return None
+            return {'museum':'Victoria and Albert Museum','id':sn,'title':s['title'],'maker':s['maker'],'date':s['date'],'dims':dims,'image':f"https://framemark.vam.ac.uk/collections/{s['iid']}/full/!900,900/0/default.jpg",'source':f'https://collections.vam.ac.uk/item/{sn}/'}
+          rec=[]
+          with ThreadPoolExecutor(max_workers=8) as ex:
+            fs=[ex.submit(detail,x) for x in stubs.items()]
+            for f in as_completed(fs):
+              try:z=f.result()
+              except:z=None
+              if z:rec.append(z)
+          rec.sort(key=lambda r:(r['title'],r['id']))
+          print('STRICT_FITS',len(rec),flush=True)
+          def image(pair):
+            i,r=pair;b=fetch(r['image'],binary=True,tries=3,timeout=25)
+            if not b:return None
+            try:
+              im=Image.open(io.BytesIO(b)).convert('RGB');im.thumbnail((1200,950),Image.Resampling.LANCZOS);p=IMG/f'{i:04d}.jpg';im.save(p,'JPEG',quality=86,optimize=True);return r,p
+            except:return None
+          got=[]
+          with ThreadPoolExecutor(max_workers=10) as ex:
+            fs=[ex.submit(image,x) for x in enumerate(rec)]
+            for f in as_completed(fs):
+              try:z=f.result()
+              except:z=None
+              if z:got.append(z)
+          got.sort(key=lambda z:(z[0]['title'],z[0]['id']))
+          print('WITH_IMAGES',len(got),flush=True)
+          with open(OUT/'records.csv','w',newline='',encoding='utf8') as f:
+            w=csv.writer(f);w.writerow(['museum','id','title','maker','date','height_cm','width_cm','depth_cm','source'])
+            for r,p in got:w.writerow([r['museum'],r['id'],r['title'],r['maker'],r['date'],*r['dims'],r['source']])
+          W,H=landscape(A4); pdf=OUT/'500mm_VA_seating_image_album.pdf';c=canvas.Canvas(str(pdf),pagesize=(W,H),pageCompression=1);c.setTitle('500 x 500 x 500 mm - V&A seating image album')
+          c.setFillColorRGB(.045,.045,.045);c.rect(0,0,W,H,fill=1,stroke=0);c.setFillColorRGB(1,1,1);c.setFont('Helvetica-Bold',28);c.drawString(32,H-62,'500 x 500 x 500 mm');c.setFont('Helvetica',13);c.drawString(32,H-88,f'Sittemobel - biletealbum - {len(got)} objekt');c.showPage()
+          mar=18;gap=8;cw=(W-2*mar-2*gap)/3;ch=(H-2*mar-gap)/2;cap=30
+          def trunc(s,mw,font='Helvetica',size=6.8):
+            s=clean(s)
+            if stringWidth(s,font,size)<=mw:return s
+            while s and stringWidth(s+'...',font,size)>mw:s=s[:-1]
+            return s.rstrip()+'...'
+          for k,(r,p) in enumerate(got):
+            pos=k%6
+            if pos==0 and k:c.showPage()
+            col=pos%3;row=1-pos//3;x=mar+col*(cw+gap);y=mar+row*(ch+gap)
+            c.setFillColorRGB(.985,.985,.985);c.rect(x,y+cap,cw,ch-cap,fill=1,stroke=0)
+            im=Image.open(p);iw,ih=im.size;s=min((cw-10)/iw,(ch-cap-10)/ih);dw,dh=iw*s,ih*s;c.drawImage(ImageReader(im),x+(cw-dw)/2,y+cap+(ch-cap-dh)/2,dw,dh,preserveAspectRatio=True)
+            c.setFillColorRGB(.07,.07,.07);c.setFont('Helvetica-Bold',7.1);c.drawString(x+2,y+17,trunc(r['title'],cw-4,'Helvetica-Bold',7.1));a,b,d=r['dims'];c.setFillColorRGB(.32,.32,.32);c.setFont('Helvetica',6.2);c.drawString(x+2,y+6,trunc(f'V&A - {a:g} x {b:g} x {d:g} cm',cw-4,'Helvetica',6.2))
+          c.save()
+          stats={'count':len(got),'strict_fits_before_images':len(rec),'search_stubs':len(stubs),'search_counts':counts,'pages':len(PdfReader(str(pdf)).pages)}; (OUT/'stats.json').write_text(json.dumps(stats,ensure_ascii=False,indent=2));print('STATS',json.dumps(stats,ensure_ascii=False),flush=True)
+          PY
+          python /tmp/vam.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vam-500mm-seat-album
+          path: vam_album/
+          retention-days: 7

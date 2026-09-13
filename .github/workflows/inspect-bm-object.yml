@@ -1,0 +1,22 @@
+name: Inspect BM stool image predicates
+on:
+  push:
+    paths: ['.github/workflows/inspect-bm-object.yml']
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -L -s -o /tmp/bm.zip 'https://huggingface.co/datasets/dejp3/british-museum-rdf-as-csv-2014/resolve/main/compiled_flat_chunk_00000.csv.zip?download=true'
+          unzip -p /tmp/bm.zip > /tmp/bm.csv
+          python - <<'PY'
+          import csv,re
+          ids=['YCA61552','YCA64081','YCA61508']
+          with open('/tmp/bm.csv',encoding='utf8',errors='replace') as f:
+            for row in csv.reader(f):
+              s,p,g,o=row
+              if any(i in s for i in ids) or any(i in o for i in ids):
+                lp=p.lower();lo=o.lower()
+                if any(k in lp for k in ['represent','image','identifier','label','display','dimension']) or any(k in lo for k in ['image','media','collectionimage']):
+                  print('LINE',s,p,o[:2000])
+          PY

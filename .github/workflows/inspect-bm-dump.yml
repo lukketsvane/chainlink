@@ -1,0 +1,31 @@
+name: Inspect BM RDF dump
+on:
+  push:
+    paths: ['.github/workflows/inspect-bm-dump.yml']
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download one British Museum CSV chunk
+        run: |
+          set -e
+          curl -L --retry 3 -o /tmp/bm.zip 'https://huggingface.co/datasets/dejp3/british-museum-rdf-as-csv-2014/resolve/main/compiled_flat_chunk_00000.csv.zip?download=true'
+          ls -lh /tmp/bm.zip
+          unzip -l /tmp/bm.zip | head
+          unzip -p /tmp/bm.zip > /tmp/bm.csv
+          python - <<'PY'
+          import csv
+          p='/tmp/bm.csv'
+          with open(p,encoding='utf-8',errors='replace') as f:
+            r=csv.reader(f);h=next(r);print('HEADER',h);print('NCOLS',len(h))
+            for i,row in zip(range(3),r):print('ROW',row[:20])
+          print('STOOL LINES')
+          n=0
+          with open(p,encoding='utf-8',errors='replace') as f:
+            for line in f:
+              if 'stool' in line.lower():
+                print(line[:2500]);n+=1
+                if n>=15:break
+          print('FOUND_SAMPLE',n)
+          PY

@@ -1,0 +1,21 @@
+name: Inspect Met API
+on:
+  push:
+    paths: ['.github/workflows/inspect-met.yml']
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          for oid in [485023,312313,544800,309823]:
+              try:
+                  with urllib.request.urlopen(f'https://collectionapi.metmuseum.org/public/collection/v1/objects/{oid}', timeout=15) as r:
+                      o=json.load(r)
+                  print('OID',oid,'public',o.get('isPublicDomain'),'name',o.get('objectName'))
+                  print('measurements=',json.dumps(o.get('measurements'),ensure_ascii=False)[:4000])
+                  print('image=',bool(o.get('primaryImageSmall')))
+              except Exception as e: print('ERR',oid,e)
+          PY

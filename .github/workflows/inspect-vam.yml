@@ -1,0 +1,26 @@
+name: Inspect V&A stool API
+on:
+  push:
+    paths: ['.github/workflows/inspect-vam.yml']
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect
+        run: |
+          python - <<'PY'
+          import json, urllib.request, urllib.parse
+          u='https://api.vam.ac.uk/v2/objects/search?'+urllib.parse.urlencode({'q_object_name':'stool','images_exist':1,'page_size':5})
+          with urllib.request.urlopen(u,timeout=20) as r:d=json.load(r)
+          print('INFO',d.get('info'))
+          for s in d.get('records',[]):
+            print('SEARCH',json.dumps(s,ensure_ascii=False)[:1800])
+            sn=s.get('systemNumber')
+            try:
+              with urllib.request.urlopen('https://api.vam.ac.uk/v2/museumobject/'+sn,timeout=20) as r:o=json.load(r)
+              rec=o.get('record',{})
+              print('DETAIL',sn,'keys',sorted([k for k in rec.keys() if 'dim' in k.lower() or 'measure' in k.lower() or 'size' in k.lower()]))
+              for k,v in rec.items():
+                if 'dim' in k.lower() or 'measure' in k.lower() or 'size' in k.lower(): print(k,json.dumps(v,ensure_ascii=False)[:3000])
+            except Exception as e: print('ERR',sn,e)
+          PY

@@ -1,0 +1,113 @@
+name: Museum seating image album
+on:
+  push:
+    paths: ['.github/workflows/album.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install aiohttp pillow reportlab requests
+      - name: Collect and render
+        shell: bash
+        run: |
+          cat > /tmp/build.py <<'PY'
+          import asyncio,aiohttp,requests,io,re,json,csv
+          from pathlib import Path
+          from PIL import Image
+          from reportlab.pdfgen import canvas
+          from reportlab.lib.pagesizes import A4,landscape
+          from reportlab.lib.utils import ImageReader
+          OUT=Path('album'); IMG=OUT/'img'; IMG.mkdir(parents=True,exist_ok=True)
+          UA='AHO design research seating corpus'
+          def clean(x): return re.sub(r'\s+',' ',str(x or '')).strip()
+          def exact_dims(o):
+            for m in o.get('measurements') or []:
+              e=m.get('elementMeasurements') or {}; z={}
+              for a,b in [('Height','h'),('Width','w'),('Depth','d'),('Diameter','dia'),('Length','w')]:
+                v=e.get(a)
+                if isinstance(v,(int,float)) and v>0:z[b]=float(v)
+              if 'h' in z and 'dia' in z: xyz=(z['h'],z['dia'],z['dia'])
+              elif all(k in z for k in ('h','w','d')): xyz=(z['h'],z['w'],z['d'])
+              else: continue
+              if max(xyz)<=50:return tuple(round(v,1) for v in xyz)
+            return None
+          rs=requests.Session();rs.headers['User-Agent']=UA
+          ids=[]
+          for q in ['stool','footstool','tabouret','ottoman','hassock','folding stool','low stool','child chair']:
+            try:
+              d=rs.get('https://collectionapi.metmuseum.org/public/collection/v1/search',params={'hasImages':'true','q':q},timeout=20).json();ids+=d.get('objectIDs') or []
+            except:pass
+          ids=list(dict.fromkeys(ids))[:2200]
+          async def fetch_json(sess,sem,oid):
+            url=f'https://collectionapi.metmuseum.org/public/collection/v1/objects/{oid}'
+            async with sem:
+              for _ in range(2):
+                try:
+                  async with sess.get(url,timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status==200:return await r.json()
+                    if r.status==429:await asyncio.sleep(.5)
+                except:pass
+              return None
+          async def collect():
+            sem=asyncio.Semaphore(55); conn=aiohttp.TCPConnector(limit=60,ttl_dns_cache=300)
+            async with aiohttp.ClientSession(headers={'User-Agent':UA},connector=conn) as s:
+              objs=await asyncio.gather(*(fetch_json(s,sem,i) for i in ids))
+            out=[]
+            words=('stool','footstool','tabouret','ottoman','hassock','chair','seat')
+            bad=('fragment','model','miniature','toy','cover','drawing','print','photograph','painting')
+            for o in objs:
+              if not o or not o.get('isPublicDomain') or not o.get('primaryImageSmall'):continue
+              name=clean(o.get('objectName')).lower()
+              if not any(w in name for w in words) or any(b in name for b in bad):continue
+              ds=exact_dims(o)
+              if not ds:continue
+              out.append({'id':o['objectID'],'title':clean(o.get('title')) or clean(o.get('objectName')),'maker':clean(o.get('artistDisplayName') or o.get('culture')),'date':clean(o.get('objectDate')),'dims':ds,'image':o['primaryImageSmall'],'source':o.get('objectURL') or ''})
+            return out
+          rec=asyncio.run(collect())
+          # stable dedupe and keep 360
+          seen=set(); rr=[]
+          for x in rec:
+            if x['id'] not in seen:seen.add(x['id']);rr.append(x)
+          rec=rr[:360]
+          async def fetch_img(sess,sem,item):
+            i,r=item
+            async with sem:
+              try:
+                async with sess.get(r['image'],timeout=aiohttp.ClientTimeout(total=15)) as q:
+                  if q.status!=200:return None
+                  b=await q.read()
+                im=Image.open(io.BytesIO(b)).convert('RGB');im.thumbnail((1200,900),Image.Resampling.LANCZOS);p=IMG/f'{i:04d}.jpg';im.save(p,'JPEG',quality=86,optimize=True);return (r,p)
+              except:return None
+          async def images():
+            sem=asyncio.Semaphore(35);conn=aiohttp.TCPConnector(limit=40,ttl_dns_cache=300)
+            async with aiohttp.ClientSession(headers={'User-Agent':UA},connector=conn) as s:
+              z=await asyncio.gather(*(fetch_img(s,sem,x) for x in enumerate(rec)))
+            return [x for x in z if x]
+          got=asyncio.run(images())
+          got.sort(key=lambda x:(x[0]['title'],x[0]['id']))
+          W,H=landscape(A4);pdf=OUT/'500mm_museum_seating_album.pdf';c=canvas.Canvas(str(pdf),pagesize=(W,H),pageCompression=1)
+          c.setFillColorRGB(.04,.04,.04);c.rect(0,0,W,H,fill=1,stroke=0);c.setFillColorRGB(1,1,1);c.setFont('Helvetica-Bold',26);c.drawString(32,H-58,'500 × 500 × 500 mm');c.setFont('Helvetica',13);c.drawString(32,H-82,f'Sittemøbel — biletealbum · {len(got)} museumsgjenstandar');c.showPage()
+          mar=20;gap=8;cw=(W-2*mar-2*gap)/3;ch=(H-2*mar-gap)/2
+          for k,(r,p) in enumerate(got):
+            pos=k%6
+            if pos==0 and k:c.showPage()
+            col=pos%3;row=1-pos//3;x=mar+col*(cw+gap);y=mar+row*(ch+gap);cap=28
+            c.setFillColorRGB(.985,.985,.985);c.rect(x,y+cap,cw,ch-cap,fill=1,stroke=0)
+            im=Image.open(p);iw,ih=im.size;s=min((cw-10)/iw,(ch-cap-10)/ih);dw,dh=iw*s,ih*s;c.drawImage(ImageReader(im),x+(cw-dw)/2,y+cap+(ch-cap-dh)/2,dw,dh)
+            c.setFillColorRGB(.07,.07,.07);c.setFont('Helvetica-Bold',7);c.drawString(x+2,y+16,clean(r['title'])[:58]);c.setFillColorRGB(.35,.35,.35);c.setFont('Helvetica',6.3);a,b,d=r['dims'];c.drawString(x+2,y+6,f'The Metropolitan Museum of Art · {a:g} × {b:g} × {d:g} cm')
+          c.save()
+          with open(OUT/'records.csv','w',newline='',encoding='utf8') as f:
+            w=csv.writer(f);w.writerow(['id','title','maker','date','h','w','d','source']);[w.writerow([r['id'],r['title'],r['maker'],r['date'],*r['dims'],r['source']]) for r,p in got]
+          (OUT/'stats.json').write_text(json.dumps({'count':len(got),'candidate_ids':len(ids)},indent=2))
+          print(json.dumps({'count':len(got),'candidate_ids':len(ids)}))
+          PY
+          python /tmp/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: museum-seat-album
+          path: album/
+          retention-days: 7

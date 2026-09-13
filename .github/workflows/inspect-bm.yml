@@ -1,0 +1,31 @@
+name: Inspect British Museum stool search
+on:
+  push:
+    paths: ['.github/workflows/inspect-bm.yml']
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install requests beautifulsoup4
+      - name: Inspect search and object HTML
+        run: |
+          python - <<'PY'
+          import requests,re
+          from bs4 import BeautifulSoup
+          H={'User-Agent':'Mozilla/5.0 AHO design research'}
+          for url in ['https://www.britishmuseum.org/collection/search?object=stool&page=1','https://www.britishmuseum.org/collection/search?keyword=stool&page=1']:
+            r=requests.get(url,headers=H,timeout=30); print('URL',r.url,'STATUS',r.status_code,'LEN',len(r.text))
+            s=BeautifulSoup(r.text,'html.parser')
+            txt=' '.join(s.stripped_strings)
+            print('TEXTSTART',txt[:1200])
+            links=[a.get('href') for a in s.find_all('a') if a.get('href') and '/collection/object/' in a.get('href')]
+            print('OBJECTLINKS',len(links),links[:20])
+            imgs=[(i.get('src'),i.get('data-src'),i.get('alt')) for i in s.find_all('img')]
+            print('IMGS',imgs[:15])
+          u='https://www.britishmuseum.org/collection/object/E_Af1818-1114-9'
+          r=requests.get(u,headers=H,timeout=30);s=BeautifulSoup(r.text,'html.parser');print('OBJ',r.status_code,len(r.text))
+          for i in s.find_all('img')[:30]: print('IMG',i.get('src'),i.get('data-src'),i.get('srcset'),i.get('alt'))
+          print('META')
+          for m in s.find_all('meta'):
+            if m.get('property') in ('og:image','og:title') or m.get('name') in ('twitter:image','description'): print(m)
+          PY

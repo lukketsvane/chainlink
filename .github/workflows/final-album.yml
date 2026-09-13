@@ -1,0 +1,263 @@
+name: Expanded 500mm museum seating album
+on:
+  push:
+    paths: ['.github/workflows/final-album.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install aiohttp requests pillow reportlab pypdf
+      - name: Collect V&A and Met seating and build image album
+        shell: bash
+        run: |
+          cat > /tmp/final_album.py <<'PY'
+          import asyncio, aiohttp, requests, io, re, json, csv, math, time
+          from pathlib import Path
+          from PIL import Image, ImageOps
+          from reportlab.pdfgen import canvas
+          from reportlab.lib.pagesizes import A4, landscape
+          from reportlab.lib.utils import ImageReader
+          from reportlab.pdfbase.pdfmetrics import stringWidth
+          from pypdf import PdfReader
+
+          OUT=Path('final_album'); IMG=OUT/'images'; IMG.mkdir(parents=True,exist_ok=True)
+          UA='AHO industrial design research — 500mm seating corpus'
+          rs=requests.Session(); rs.headers.update({'User-Agent':UA})
+
+          def clean(x): return re.sub(r'\s+',' ',str(x or '')).strip()
+          def getj(url, params=None, tries=4, timeout=25):
+              for a in range(tries):
+                  try:
+                      r=rs.get(url,params=params,timeout=timeout)
+                      if r.status_code==429:
+                          time.sleep(1.0+a); continue
+                      r.raise_for_status(); return r.json()
+                  except Exception:
+                      if a==tries-1:return None
+                      time.sleep(.6*(a+1))
+              return None
+
+          def unit_cm(value, unit):
+              try:v=float(str(value).replace(',','.'))
+              except:return None
+              u=clean(unit).lower()
+              if u in ('cm','centimetre','centimeter','centimetres','centimeters'):return v
+              if u in ('mm','millimetre','millimeter','millimetres','millimeters'):return v/10
+              if u in ('m','metre','meter','metres','meters'):return v*100
+              if u in ('in','inch','inches'):return v*2.54
+              return None
+
+          def fit_from_axes(ax):
+              # Conservative: each known overall axis must be <=50cm and all 3 axes must be represented.
+              if 'height' not in ax:return None
+              if 'diameter' in ax:
+                  vals=(ax['height'],ax['diameter'],ax['diameter'])
+              elif all(k in ax for k in ('height','width','depth')):
+                  vals=(ax['height'],ax['width'],ax['depth'])
+              elif all(k in ax for k in ('height','width','length')):
+                  vals=(ax['height'],ax['width'],ax['length'])
+              elif all(k in ax for k in ('height','length','depth')):
+                  vals=(ax['height'],ax['length'],ax['depth'])
+              else:return None
+              if min(vals)<=0 or max(vals)>50.0001:return None
+              return tuple(round(v,1) for v in vals)
+
+          # ---------------- V&A ----------------
+          vam_terms=['stool','footstool','tabouret','ottoman','hassock','folding stool','low stool','milking stool','piano stool','child stool']
+          vam_search={}
+          vam_counts={}
+          for term in vam_terms:
+              first=getj('https://api.vam.ac.uk/v2/objects/search',{'q_object_name':term,'images_exist':1,'page_size':100,'page':1})
+              if not first:continue
+              info=first.get('info') or {}; pages=min(int(info.get('pages') or 1),12)
+              vam_counts[term]=int(info.get('record_count') or 0)
+              batches=[first]
+              for p in range(2,pages+1):
+                  d=getj('https://api.vam.ac.uk/v2/objects/search',{'q_object_name':term,'images_exist':1,'page_size':100,'page':p})
+                  if d:batches.append(d)
+              for d in batches:
+                  for s in d.get('records') or []:
+                      sn=s.get('systemNumber'); iid=s.get('_primaryImageId')
+                      if not sn or not iid:continue
+                      vam_search[sn]={
+                          'id':sn,
+                          'title':clean(s.get('_primaryTitle')) or clean(s.get('objectType')) or term.title(),
+                          'maker':clean((s.get('_primaryMaker') or {}).get('name')),
+                          'date':clean(s.get('_primaryDate')),
+                          'image_id':iid,
+                          'objectType':clean(s.get('objectType')),
+                      }
+
+          async def fetch_vam_detail(sess,sem,sn):
+              url='https://api.vam.ac.uk/v2/museumobject/'+sn
+              for attempt in range(3):
+                  async with sem:
+                      try:
+                          async with sess.get(url,timeout=aiohttp.ClientTimeout(total=18)) as r:
+                              if r.status==200:return await r.json()
+                              if r.status==429:await asyncio.sleep(.8*(attempt+1))
+                      except:pass
+                  await asyncio.sleep(.15*(attempt+1))
+              return None
+
+          async def collect_vam():
+              sem=asyncio.Semaphore(10); conn=aiohttp.TCPConnector(limit=12,ttl_dns_cache=300)
+              async with aiohttp.ClientSession(headers={'User-Agent':UA},connector=conn) as s:
+                  tasks={sn:asyncio.create_task(fetch_vam_detail(s,sem,sn)) for sn in vam_search}
+                  out=[]
+                  for sn,t in tasks.items():
+                      o=await t
+                      if not o:continue
+                      rec=o.get('record') or {}; ax={}
+                      for d in rec.get('dimensions') or []:
+                          name=clean(d.get('dimension')).lower()
+                          cm=unit_cm(d.get('value'),d.get('unit'))
+                          if cm is None or cm<=0:continue
+                          key=None
+                          if 'height' in name:key='height'
+                          elif 'width' in name:key='width'
+                          elif 'depth' in name:key='depth'
+                          elif 'diameter' in name:key='diameter'
+                          elif 'length' in name:key='length'
+                          if key:ax[key]=max(ax.get(key,0),cm)
+                      dims=fit_from_axes(ax)
+                      if not dims:continue
+                      base=vam_search[sn]
+                      out.append({
+                          'museum':'Victoria and Albert Museum','id':sn,'title':base['title'],'maker':base['maker'],'date':base['date'],'dims':dims,
+                          'image':f"https://framemark.vam.ac.uk/collections/{base['image_id']}/full/!900,900/0/default.jpg",
+                          'source':f'https://collections.vam.ac.uk/item/{sn}/','rights':'V&A collection image'
+                      })
+                  return out
+          vam_records=asyncio.run(collect_vam())
+
+          # ---------------- The Met ----------------
+          met_terms=['stool','footstool','tabouret','ottoman','hassock','folding stool','low stool','child chair','prestige stool','caryatid stool']
+          met_ids=[]
+          for q in met_terms:
+              d=getj('https://collectionapi.metmuseum.org/public/collection/v1/search',{'hasImages':'true','q':q}) or {}
+              met_ids += d.get('objectIDs') or []
+          met_ids=list(dict.fromkeys(met_ids))[:2400]
+
+          async def fetch_met(sess,sem,oid):
+              url=f'https://collectionapi.metmuseum.org/public/collection/v1/objects/{oid}'
+              for attempt in range(4):
+                  async with sem:
+                      try:
+                          async with sess.get(url,timeout=aiohttp.ClientTimeout(total=18)) as r:
+                              if r.status==200:return await r.json()
+                              if r.status==429:await asyncio.sleep(1.0*(attempt+1))
+                      except:pass
+                  await asyncio.sleep(.22*(attempt+1))
+              return None
+
+          def met_dims(o):
+              # Merge dimensions across measurement groups; use maxima conservatively.
+              ax={}
+              for m in o.get('measurements') or []:
+                  e=m.get('elementMeasurements') or {}
+                  for src,key in [('Height','height'),('Width','width'),('Depth','depth'),('Diameter','diameter'),('Length','length')]:
+                      v=e.get(src)
+                      if isinstance(v,(int,float)) and float(v)>0:ax[key]=max(ax.get(key,0),float(v))
+              return fit_from_axes(ax)
+
+          async def collect_met():
+              sem=asyncio.Semaphore(9); conn=aiohttp.TCPConnector(limit=10,ttl_dns_cache=300)
+              out=[]
+              async with aiohttp.ClientSession(headers={'User-Agent':UA},connector=conn) as s:
+                  # modest batches avoid hammering the museum API
+                  for start in range(0,len(met_ids),120):
+                      batch=met_ids[start:start+120]
+                      objs=await asyncio.gather(*(fetch_met(s,sem,i) for i in batch))
+                      for o in objs:
+                          if not o or not o.get('isPublicDomain') or not o.get('primaryImageSmall'):continue
+                          name=clean(o.get('objectName')).lower(); title=clean(o.get('title')).lower()
+                          if not any(k in name for k in ('stool','footstool','tabouret','ottoman','hassock','chair','seat')):continue
+                          if any(k in name for k in ('fragment','model','miniature','toy','cover','drawing','print','photograph','painting')):continue
+                          dims=met_dims(o)
+                          if not dims:continue
+                          out.append({'museum':'The Metropolitan Museum of Art','id':o.get('objectID'),'title':clean(o.get('title')) or clean(o.get('objectName')),'maker':clean(o.get('artistDisplayName') or o.get('culture')),'date':clean(o.get('objectDate')),'dims':dims,'image':o.get('primaryImageSmall'),'source':o.get('objectURL') or '', 'rights':'Public domain'})
+                      await asyncio.sleep(.18)
+              return out
+          met_records=asyncio.run(collect_met())
+
+          # ---------------- Combine / dedupe ----------------
+          all_records=[]; seen=set()
+          for r in vam_records+met_records:
+              key=(r['museum'],str(r['id']))
+              if key in seen:continue
+              seen.add(key); all_records.append(r)
+          all_records.sort(key=lambda r:(r['museum'],r['title'],str(r['id'])))
+
+          # ---------------- Images ----------------
+          async def fetch_image(sess,sem,i,r):
+              for attempt in range(3):
+                  async with sem:
+                      try:
+                          async with sess.get(r['image'],timeout=aiohttp.ClientTimeout(total=22)) as q:
+                              if q.status==200:
+                                  b=await q.read(); im=Image.open(io.BytesIO(b)).convert('RGB')
+                                  # Contain image; no crop. Normalize to keep PDF manageable.
+                                  im.thumbnail((1200,950),Image.Resampling.LANCZOS)
+                                  p=IMG/f'{i:04d}.jpg'; im.save(p,'JPEG',quality=86,optimize=True)
+                                  return r,p
+                      except:pass
+                  await asyncio.sleep(.25*(attempt+1))
+              return None
+          async def get_images(records):
+              sem=asyncio.Semaphore(16); conn=aiohttp.TCPConnector(limit=18,ttl_dns_cache=300)
+              async with aiohttp.ClientSession(headers={'User-Agent':UA},connector=conn) as s:
+                  z=await asyncio.gather(*(fetch_image(s,sem,i,r) for i,r in enumerate(records)))
+              return [x for x in z if x]
+          got=asyncio.run(get_images(all_records))
+
+          # ---------------- Metadata CSV ----------------
+          with open(OUT/'records.csv','w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f); w.writerow(['museum','id','title','maker','date','height_cm','width_or_diameter_cm','depth_or_diameter_cm','source','rights'])
+              for r,p in got:w.writerow([r['museum'],r['id'],r['title'],r['maker'],r['date'],*r['dims'],r['source'],r['rights']])
+
+          # ---------------- PDF: image album only ----------------
+          pdf=OUT/'500mm_seating_image_album_hundreds.pdf'; W,H=landscape(A4)
+          c=canvas.Canvas(str(pdf),pagesize=(W,H),pageCompression=1)
+          c.setTitle('500 × 500 × 500 mm — sittemøbel biletealbum')
+          c.setFillColorRGB(.045,.045,.045); c.rect(0,0,W,H,fill=1,stroke=0)
+          c.setFillColorRGB(1,1,1); c.setFont('Helvetica-Bold',28); c.drawString(32,H-62,'500 × 500 × 500 mm')
+          c.setFont('Helvetica',13); c.drawString(32,H-88,f'Sittemøbel — biletealbum · {len(got)} museumsgjenstandar')
+          c.setFont('Helvetica',7.5); c.drawString(32,29,'Alle viste objekt har tre dokumenterte romlege aksar på maksimalt 50 cm. Museumfoto; kjelde i innebygd metadata/CSV.')
+          c.showPage()
+          mar=18; gap=8; cols=3; rows=2; cw=(W-2*mar-2*gap)/3; ch=(H-2*mar-gap)/2; cap=30
+          def trunc(text,maxw,font='Helvetica',size=6.8):
+              s=clean(text)
+              if stringWidth(s,font,size)<=maxw:return s
+              while s and stringWidth(s+'…',font,size)>maxw:s=s[:-1]
+              return s.rstrip()+'…'
+          for k,(r,p) in enumerate(got):
+              pos=k%6
+              if pos==0 and k:c.showPage()
+              col=pos%3; row=1-pos//3; x=mar+col*(cw+gap); y=mar+row*(ch+gap)
+              c.setFillColorRGB(.985,.985,.985); c.rect(x,y+cap,cw,ch-cap,fill=1,stroke=0)
+              try:
+                  im=Image.open(p); iw,ih=im.size; s=min((cw-10)/iw,(ch-cap-10)/ih); dw,dh=iw*s,ih*s
+                  c.drawImage(ImageReader(im),x+(cw-dw)/2,y+cap+(ch-cap-dh)/2,dw,dh,preserveAspectRatio=True,mask='auto')
+              except: pass
+              c.setFillColorRGB(.07,.07,.07); c.setFont('Helvetica-Bold',7.1); c.drawString(x+2,y+17,trunc(r['title'],cw-4,'Helvetica-Bold',7.1))
+              h,a,b=r['dims']; c.setFillColorRGB(.32,.32,.32); c.setFont('Helvetica',6.2); c.drawString(x+2,y+6,trunc(f"{r['museum']} · {h:g} × {a:g} × {b:g} cm",cw-4,'Helvetica',6.2))
+          c.save()
+
+          stats={'count':len(got),'vam_fit_before_image_download':len(vam_records),'met_fit_before_image_download':len(met_records),'vam_search_counts':vam_counts,'met_candidate_ids':len(met_ids),'pages':len(PdfReader(str(pdf)).pages)}
+          (OUT/'stats.json').write_text(json.dumps(stats,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(stats,ensure_ascii=False))
+          PY
+          python /tmp/final_album.py
+      - name: Upload album
+        uses: actions/upload-artifact@v4
+        with:
+          name: expanded-500mm-seat-album
+          path: final_album/
+          retention-days: 7

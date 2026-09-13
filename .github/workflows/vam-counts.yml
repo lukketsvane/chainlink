@@ -1,0 +1,20 @@
+name: Count V&A seating object types
+on:
+  push:
+    paths: ['.github/workflows/vam-counts.yml']
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          python - <<'PY'
+          import json,urllib.request,urllib.parse
+          terms=['stool','footstool','tabouret','ottoman','hassock','folding stool','low stool','milking stool','piano stool','child stool','chair','seat','kneeling stool','music stool']
+          for t in terms:
+            u='https://api.vam.ac.uk/v2/objects/search?'+urllib.parse.urlencode({'q_object_name':t,'images_exist':1,'page_size':1})
+            try:
+              req=urllib.request.Request(u,headers={'User-Agent':'Mozilla/5.0 AHO design research'})
+              with urllib.request.urlopen(req,timeout=20) as r:d=json.load(r)
+              print(t, json.dumps(d.get('info'),ensure_ascii=False))
+            except Exception as e: print('ERR',t,repr(e))
+          PY
